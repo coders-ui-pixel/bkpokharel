@@ -4,6 +4,7 @@ build/
 .env
 .env.local
 *.log
+*.tsbuildinfo
 .DS_Store
 
 # Runtime-uploaded content (course covers, QR codes, payment proofs, notes, etc.)
