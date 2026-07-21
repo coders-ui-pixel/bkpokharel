@@ -1,0 +1,9 @@
+---
+deployment:
+  tasks:
+    - export DEPLOYPATH=/home/YOURUSERNAME/repositories/bkpokharel
+    - export NODEENV="source /home/YOURUSERNAME/nodevenv/repositories/bkpokharel/server/20/bin/activate"
+    - /bin/bash -c "$NODEENV && cd $DEPLOYPATH/server && npm install && npx prisma generate && npx prisma migrate deploy && npm run build"
+    - /bin/bash -c "$NODEENV && cd $DEPLOYPATH/client && npm install && npm run build"
+    - /bin/mkdir -p $DEPLOYPATH/server/tmp
+    - /bin/touch $DEPLOYPATH/server/tmp/restart.txt
