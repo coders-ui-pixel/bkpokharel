@@ -2,7 +2,7 @@
 deployment:
   tasks:
     - export DEPLOYPATH=/home/bkpokhar/repositories/bkpokharel
-    - export NODEENV="source /home/bkpokhar/nodevenv/repositories/bkpokharel/server/20/bin/activate"
+    - export NODEENV="source /home/bkpokhar/nodevenv/repositories/bkpokharel/server/22/bin/activate"
     - /bin/bash -c "$NODEENV && cd $DEPLOYPATH/server && npm install && npx prisma generate && npx prisma migrate deploy && npm run build"
     - /bin/bash -c "$NODEENV && cd $DEPLOYPATH/client && npm install && npm run build"
     - /bin/mkdir -p $DEPLOYPATH/server/tmp
