@@ -1,8 +1,8 @@
 import { NextFunction, Request, Response } from "express";
-import { AdminRole, Role } from "@prisma/client";
+import type { AdminRole, Role } from "../config/enums";
 import { ApiError } from "../utils/ApiError";
 import { verifyAccessToken } from "../services/tokenService";
-import { prisma } from "../config/db";
+import { db } from "../config/db";
 
 declare global {
   namespace Express {
@@ -57,8 +57,10 @@ export function requireAdminRole(...roles: AdminRole[]) {
       next(new ApiError(403, "Insufficient permissions"));
       return;
     }
-    prisma.user
-      .findUnique({ where: { id: req.user.id }, select: { adminRole: true } })
+    db.selectFrom("users")
+      .select("adminRole")
+      .where("id", "=", req.user.id)
+      .executeTakeFirst()
       .then((user) => {
         if (!user?.adminRole || !roles.includes(user.adminRole)) {
           next(new ApiError(403, "Insufficient permissions"));

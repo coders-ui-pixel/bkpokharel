@@ -1,4 +1,4 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 
 export async function getOverview() {
   const now = new Date();
@@ -6,29 +6,38 @@ export async function getOverview() {
   const thirtyDaysAgo = new Date(now.getTime() - 30 * 86400000);
 
   const [
-    totalStudents,
-    activeStudents7d,
-    activeStudents30d,
+    totalStudentsRow,
+    activeStudents7dRow,
+    activeStudents30dRow,
     practiceAttempts,
     liveExamAttempts,
     revenueRows,
   ] = await Promise.all([
-    prisma.user.count({ where: { role: "user" } }),
-    prisma.gamificationProfile.count({ where: { lastActivityDate: { gte: sevenDaysAgo } } }),
-    prisma.gamificationProfile.count({ where: { lastActivityDate: { gte: thirtyDaysAgo } } }),
-    prisma.practiceAttempt.findMany({
-      where: { status: "submitted" },
-      select: { score: true, totalMarks: true },
-    }),
-    prisma.liveExamAttempt.findMany({
-      where: { status: "submitted" },
-      select: { score: true, totalMarks: true },
-    }),
-    prisma.enrollment.findMany({
-      where: { status: "approved", course: { isPaid: true } },
-      include: { course: { select: { price: true } } },
-    }),
+    db.selectFrom("users").select((eb) => eb.fn.countAll().as("count")).where("role", "=", "user").executeTakeFirstOrThrow(),
+    db
+      .selectFrom("gamificationProfiles")
+      .select((eb) => eb.fn.countAll().as("count"))
+      .where("lastActivityDate", ">=", sevenDaysAgo)
+      .executeTakeFirstOrThrow(),
+    db
+      .selectFrom("gamificationProfiles")
+      .select((eb) => eb.fn.countAll().as("count"))
+      .where("lastActivityDate", ">=", thirtyDaysAgo)
+      .executeTakeFirstOrThrow(),
+    db.selectFrom("practiceAttempts").select(["score", "totalMarks"]).where("status", "=", "submitted").execute(),
+    db.selectFrom("liveExamAttempts").select(["score", "totalMarks"]).where("status", "=", "submitted").execute(),
+    db
+      .selectFrom("enrollments")
+      .innerJoin("courses", "courses.id", "enrollments.courseId")
+      .select(["courses.price as price"])
+      .where("enrollments.status", "=", "approved")
+      .where("courses.isPaid", "=", true)
+      .execute(),
   ]);
+
+  const totalStudents = Number(totalStudentsRow.count);
+  const activeStudents7d = Number(activeStudents7dRow.count);
+  const activeStudents30d = Number(activeStudents30dRow.count);
 
   const allAttempts = [...practiceAttempts, ...liveExamAttempts];
   const avgScorePercent = allAttempts.length
@@ -37,7 +46,7 @@ export async function getOverview() {
       100
     : 0;
 
-  const estimatedRevenue = revenueRows.reduce((sum, e) => sum + Number(e.course.price ?? 0), 0);
+  const estimatedRevenue = revenueRows.reduce((sum, e) => sum + Number(e.price ?? 0), 0);
 
   return {
     totalStudents,
@@ -54,36 +63,47 @@ export async function getOverview() {
 
 export async function getWeakChapters(limit = 10) {
   const [practiceAnswers, liveAnswers] = await Promise.all([
-    prisma.attemptAnswer.findMany({
-      where: { selectedOption: { not: null } },
-      select: {
-        isCorrect: true,
-        question: { select: { chapterId: true, chapter: { select: { title: true, subject: { select: { title: true } } } } } },
-      },
-    }),
-    prisma.liveExamAnswer.findMany({
-      where: { selectedOption: { not: null } },
-      select: {
-        isCorrect: true,
-        question: { select: { chapterId: true, chapter: { select: { title: true, subject: { select: { title: true } } } } } },
-      },
-    }),
+    db
+      .selectFrom("attemptAnswers")
+      .innerJoin("questions", "questions.id", "attemptAnswers.questionId")
+      .innerJoin("chapters", "chapters.id", "questions.chapterId")
+      .innerJoin("subjects", "subjects.id", "chapters.subjectId")
+      .select([
+        "attemptAnswers.isCorrect as isCorrect",
+        "questions.chapterId as chapterId",
+        "chapters.title as chapterTitle",
+        "subjects.title as subjectTitle",
+      ])
+      .where("attemptAnswers.selectedOption", "is not", null)
+      .execute(),
+    db
+      .selectFrom("liveExamAnswers")
+      .innerJoin("questions", "questions.id", "liveExamAnswers.questionId")
+      .innerJoin("chapters", "chapters.id", "questions.chapterId")
+      .innerJoin("subjects", "subjects.id", "chapters.subjectId")
+      .select([
+        "liveExamAnswers.isCorrect as isCorrect",
+        "questions.chapterId as chapterId",
+        "chapters.title as chapterTitle",
+        "subjects.title as subjectTitle",
+      ])
+      .where("liveExamAnswers.selectedOption", "is not", null)
+      .execute(),
   ]);
 
   const stats = new Map<number, { title: string; subject: string; correct: number; total: number }>();
 
   for (const a of [...practiceAnswers, ...liveAnswers]) {
-    const chapterId = a.question.chapterId;
-    if (!chapterId || !a.question.chapter) continue;
-    const entry = stats.get(chapterId) ?? {
-      title: a.question.chapter.title,
-      subject: a.question.chapter.subject.title,
+    if (a.chapterId === null) continue;
+    const entry = stats.get(a.chapterId) ?? {
+      title: a.chapterTitle,
+      subject: a.subjectTitle,
       correct: 0,
       total: 0,
     };
     entry.total += 1;
     if (a.isCorrect) entry.correct += 1;
-    stats.set(chapterId, entry);
+    stats.set(a.chapterId, entry);
   }
 
   return Array.from(stats.entries())
@@ -100,9 +120,10 @@ export async function getWeakChapters(limit = 10) {
 }
 
 export async function getDeviceBreakdown() {
-  const rows = await prisma.refreshToken.groupBy({
-    by: ["deviceType"],
-    _count: { _all: true },
-  });
-  return rows.map((r) => ({ deviceType: r.deviceType ?? "unknown", count: r._count._all }));
+  const rows = await db
+    .selectFrom("refreshTokens")
+    .select(["deviceType", (eb) => eb.fn.countAll().as("count")])
+    .groupBy("deviceType")
+    .execute();
+  return rows.map((r) => ({ deviceType: r.deviceType ?? "unknown", count: Number(r.count) }));
 }

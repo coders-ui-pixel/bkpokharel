@@ -1,4 +1,4 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { BADGES } from "./badges";
 
 function startOfDay(d: Date): Date {
@@ -8,11 +8,23 @@ function startOfDay(d: Date): Date {
 }
 
 async function getOrCreateProfile(userId: number) {
-  return prisma.gamificationProfile.upsert({
-    where: { userId },
-    create: { userId },
-    update: {},
-  });
+  const existing = await db
+    .selectFrom("gamificationProfiles")
+    .selectAll()
+    .where("userId", "=", userId)
+    .executeTakeFirst();
+  if (existing) return existing;
+
+  try {
+    await db.insertInto("gamificationProfiles").values({ userId, updatedAt: new Date() }).execute();
+  } catch {
+    // Duplicate-key race: another concurrent call already created the profile.
+  }
+  return db
+    .selectFrom("gamificationProfiles")
+    .selectAll()
+    .where("userId", "=", userId)
+    .executeTakeFirstOrThrow();
 }
 
 export async function awardActivity(userId: number, xpAmount: number) {
@@ -34,25 +46,37 @@ export async function awardActivity(userId: number, xpAmount: number) {
     }
   }
 
-  const updated = await prisma.gamificationProfile.update({
-    where: { userId },
-    data: {
+  await db
+    .updateTable("gamificationProfiles")
+    .set({
       xp: profile.xp + xpAmount,
       coins: profile.coins + Math.round(xpAmount / 2),
       currentStreak: nextStreak,
       longestStreak: Math.max(profile.longestStreak, nextStreak),
       lastActivityDate: today,
-    },
-  });
+      updatedAt: new Date(),
+    })
+    .where("userId", "=", userId)
+    .execute();
+  const updated = await db
+    .selectFrom("gamificationProfiles")
+    .selectAll()
+    .where("userId", "=", userId)
+    .executeTakeFirstOrThrow();
 
-  const earned = await prisma.userBadge.findMany({ where: { userId }, select: { badgeKey: true } });
+  const earned = await db
+    .selectFrom("userBadges")
+    .select(["badgeKey"])
+    .where("userId", "=", userId)
+    .execute();
   const earnedKeys = new Set(earned.map((b) => b.badgeKey));
   const toAward = BADGES.filter((b) => !earnedKeys.has(b.key) && b.check(updated));
 
   if (toAward.length > 0) {
-    await prisma.userBadge.createMany({
-      data: toAward.map((b) => ({ userId, badgeKey: b.key })),
-    });
+    await db
+      .insertInto("userBadges")
+      .values(toAward.map((b) => ({ userId, badgeKey: b.key })))
+      .execute();
   }
 
   return {
@@ -63,9 +87,13 @@ export async function awardActivity(userId: number, xpAmount: number) {
 
 export async function getProfile(userId: number) {
   const profile = await getOrCreateProfile(userId);
-  const earned = await prisma.userBadge.findMany({ where: { userId } });
+  const earned = await db.selectFrom("userBadges").selectAll().where("userId", "=", userId).execute();
   const earnedByKey = new Map(earned.map((b) => [b.badgeKey, b.earnedAt]));
-  const higherRanked = await prisma.gamificationProfile.count({ where: { xp: { gt: profile.xp } } });
+  const higherRanked = await db
+    .selectFrom("gamificationProfiles")
+    .select((eb) => eb.fn.countAll().as("count"))
+    .where("xp", ">", profile.xp)
+    .executeTakeFirstOrThrow();
 
   return {
     xp: profile.xp,
@@ -73,7 +101,7 @@ export async function getProfile(userId: number) {
     currentStreak: profile.currentStreak,
     longestStreak: profile.longestStreak,
     lastActivityDate: profile.lastActivityDate,
-    rank: higherRanked + 1,
+    rank: Number(higherRanked.count) + 1,
     badges: BADGES.map((b) => ({
       key: b.key,
       label: b.label,
@@ -86,15 +114,17 @@ export async function getProfile(userId: number) {
 }
 
 export async function getLeaderboard(limit = 20) {
-  const profiles = await prisma.gamificationProfile.findMany({
-    orderBy: { xp: "desc" },
-    take: limit,
-    include: { user: { select: { name: true } } },
-  });
+  const profiles = await db
+    .selectFrom("gamificationProfiles")
+    .innerJoin("users", "users.id", "gamificationProfiles.userId")
+    .select(["gamificationProfiles.xp", "gamificationProfiles.currentStreak", "users.name"])
+    .orderBy("gamificationProfiles.xp", "desc")
+    .limit(limit)
+    .execute();
 
   return profiles.map((p, i) => ({
     rank: i + 1,
-    name: p.user.name,
+    name: p.name,
     xp: p.xp,
     currentStreak: p.currentStreak,
   }));

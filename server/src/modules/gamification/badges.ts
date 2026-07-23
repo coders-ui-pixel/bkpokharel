@@ -1,11 +1,12 @@
-import { GamificationProfile } from "@prisma/client";
+import type { Selectable } from "kysely";
+import type { GamificationProfiles } from "../../config/db-types";
 
 export interface BadgeDefinition {
   key: string;
   label: string;
   description: string;
   icon: string;
-  check: (profile: GamificationProfile) => boolean;
+  check: (profile: Selectable<GamificationProfiles>) => boolean;
 }
 
 export const BADGES: BadgeDefinition[] = [

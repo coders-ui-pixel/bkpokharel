@@ -1,4 +1,4 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 
 export async function log(
   adminId: number,
@@ -7,28 +7,34 @@ export async function log(
   targetId?: number,
   metadata?: Record<string, unknown>
 ) {
-  await prisma.auditLog.create({
-    data: {
+  await db
+    .insertInto("auditLogs")
+    .values({
       adminId,
       action,
       targetType,
-      targetId,
-      metadata: metadata ? JSON.stringify(metadata) : undefined,
-    },
-  });
+      targetId: targetId ?? null,
+      metadata: metadata ? JSON.stringify(metadata) : null,
+    })
+    .execute();
 }
 
 export async function list(limit = 100) {
-  const logs = await prisma.auditLog.findMany({
-    orderBy: { createdAt: "desc" },
-    take: limit,
-  });
+  const logs = await db
+    .selectFrom("auditLogs")
+    .selectAll()
+    .orderBy("createdAt", "desc")
+    .limit(limit)
+    .execute();
 
   const adminIds = Array.from(new Set(logs.map((l) => l.adminId)));
-  const admins = await prisma.user.findMany({
-    where: { id: { in: adminIds } },
-    select: { id: true, name: true, email: true },
-  });
+  const admins = adminIds.length
+    ? await db
+        .selectFrom("users")
+        .select(["id", "name", "email"])
+        .where("id", "in", adminIds)
+        .execute()
+    : [];
   const adminById = new Map(admins.map((a) => [a.id, a]));
 
   return logs.map((l) => ({

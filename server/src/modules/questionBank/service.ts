@@ -1,6 +1,7 @@
 import { parse } from "csv-parse/sync";
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { ApiError } from "../../utils/ApiError";
+import type { Difficulty } from "../../config/enums";
 import { CreateQuestionInput, UpdateQuestionInput, csvRowSchema, ConfirmCsvImportInput } from "./schema";
 
 function toTagsJson(tags?: string[]): string | null {
@@ -12,44 +13,47 @@ export async function listQuestions(filters: {
   subjectId?: number;
   difficulty?: string;
 }) {
-  return prisma.question.findMany({
-    where: {
-      isActive: true,
-      ...(filters.chapterId ? { chapterId: filters.chapterId } : {}),
-      ...(filters.subjectId ? { subjectId: filters.subjectId } : {}),
-      ...(filters.difficulty ? { difficulty: filters.difficulty as any } : {}),
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  let query = db.selectFrom("questions").selectAll().where("isActive", "=", true);
+  if (filters.chapterId) query = query.where("chapterId", "=", filters.chapterId);
+  if (filters.subjectId) query = query.where("subjectId", "=", filters.subjectId);
+  if (filters.difficulty) query = query.where("difficulty", "=", filters.difficulty as Difficulty);
+  return query.orderBy("createdAt", "desc").execute();
 }
 
 export async function createQuestion(input: CreateQuestionInput, createdBy: number) {
-  return prisma.question.create({
-    data: {
-      chapterId: input.chapterId,
-      subjectId: input.subjectId,
+  const result = await db
+    .insertInto("questions")
+    .values({
+      chapterId: input.chapterId ?? null,
+      subjectId: input.subjectId ?? null,
       questionText: input.questionText,
       optionA: input.optionA,
       optionB: input.optionB,
       optionC: input.optionC,
       optionD: input.optionD,
       correctOption: input.correctOption,
-      marks: input.marks,
-      difficulty: input.difficulty,
+      marks: String(input.marks ?? 1),
+      difficulty: input.difficulty ?? null,
       tags: toTagsJson(input.tags),
-      explanation: input.explanation,
+      explanation: input.explanation ?? null,
       createdBy,
-    },
-  });
+      updatedAt: new Date(),
+    })
+    .executeTakeFirstOrThrow();
+  return db
+    .selectFrom("questions")
+    .selectAll()
+    .where("id", "=", Number(result.insertId))
+    .executeTakeFirstOrThrow();
 }
 
 export async function updateQuestion(id: number, input: UpdateQuestionInput) {
-  const existing = await prisma.question.findUnique({ where: { id } });
+  const existing = await db.selectFrom("questions").select("id").where("id", "=", id).executeTakeFirst();
   if (!existing) throw new ApiError(404, "Question not found");
 
-  return prisma.question.update({
-    where: { id },
-    data: {
+  await db
+    .updateTable("questions")
+    .set({
       ...(input.chapterId !== undefined ? { chapterId: input.chapterId } : {}),
       ...(input.subjectId !== undefined ? { subjectId: input.subjectId } : {}),
       ...(input.questionText !== undefined ? { questionText: input.questionText } : {}),
@@ -58,18 +62,21 @@ export async function updateQuestion(id: number, input: UpdateQuestionInput) {
       ...(input.optionC !== undefined ? { optionC: input.optionC } : {}),
       ...(input.optionD !== undefined ? { optionD: input.optionD } : {}),
       ...(input.correctOption !== undefined ? { correctOption: input.correctOption } : {}),
-      ...(input.marks !== undefined ? { marks: input.marks } : {}),
+      ...(input.marks !== undefined ? { marks: String(input.marks) } : {}),
       ...(input.difficulty !== undefined ? { difficulty: input.difficulty } : {}),
       ...(input.tags !== undefined ? { tags: toTagsJson(input.tags) } : {}),
       ...(input.explanation !== undefined ? { explanation: input.explanation } : {}),
-    },
-  });
+      updatedAt: new Date(),
+    })
+    .where("id", "=", id)
+    .execute();
+  return db.selectFrom("questions").selectAll().where("id", "=", id).executeTakeFirstOrThrow();
 }
 
 export async function deleteQuestion(id: number) {
-  const existing = await prisma.question.findUnique({ where: { id } });
+  const existing = await db.selectFrom("questions").select("id").where("id", "=", id).executeTakeFirst();
   if (!existing) throw new ApiError(404, "Question not found");
-  await prisma.question.update({ where: { id }, data: { isActive: false } });
+  await db.updateTable("questions").set({ isActive: false }).where("id", "=", id).execute();
 }
 
 interface CsvRowResult {
@@ -91,7 +98,7 @@ interface CsvRowResult {
 }
 
 export async function dryRunCsvImport(chapterId: number, defaultMarks: number, buffer: Buffer) {
-  const chapter = await prisma.chapter.findUnique({ where: { id: chapterId } });
+  const chapter = await db.selectFrom("chapters").select("id").where("id", "=", chapterId).executeTakeFirst();
   if (!chapter) throw new ApiError(404, "Chapter not found");
 
   let records: Record<string, string>[];
@@ -146,15 +153,19 @@ export async function dryRunCsvImport(chapterId: number, defaultMarks: number, b
 }
 
 export async function confirmCsvImport(input: ConfirmCsvImportInput, createdBy: number) {
-  const chapter = await prisma.chapter.findFirst({
-    where: { id: input.chapterId, subjectId: input.subjectId },
-  });
+  const chapter = await db
+    .selectFrom("chapters")
+    .select("id")
+    .where("id", "=", input.chapterId)
+    .where("subjectId", "=", input.subjectId)
+    .executeTakeFirst();
   if (!chapter) throw new ApiError(404, "Chapter not found for this subject");
 
-  const result = await prisma.$transaction(
-    input.rows.map((row) =>
-      prisma.question.create({
-        data: {
+  await db.transaction().execute(async (trx) => {
+    for (const row of input.rows) {
+      await trx
+        .insertInto("questions")
+        .values({
           subjectId: input.subjectId,
           chapterId: input.chapterId,
           questionText: row.questionText,
@@ -163,14 +174,15 @@ export async function confirmCsvImport(input: ConfirmCsvImportInput, createdBy: 
           optionC: row.optionC,
           optionD: row.optionD,
           correctOption: row.correctOption,
-          marks: row.marks,
-          difficulty: row.difficulty,
+          marks: String(row.marks),
+          difficulty: row.difficulty ?? null,
           tags: toTagsJson(row.tags),
-          explanation: row.explanation,
+          explanation: row.explanation ?? null,
           createdBy,
-        },
-      })
-    )
-  );
-  return { inserted: result.length };
+          updatedAt: new Date(),
+        })
+        .execute();
+    }
+  });
+  return { inserted: input.rows.length };
 }

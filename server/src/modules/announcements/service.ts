@@ -1,43 +1,57 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { ApiError } from "../../utils/ApiError";
 import { sendEmail } from "../../services/emailService";
 import { CreateAnnouncementInput, UpdateAnnouncementInput } from "./schema";
 
 export async function listAll() {
-  return prisma.announcement.findMany({ orderBy: { createdAt: "desc" } });
+  return db.selectFrom("announcements").selectAll().orderBy("createdAt", "desc").execute();
 }
 
 export async function listActive() {
   const now = new Date();
-  return prisma.announcement.findMany({
-    where: { isActive: true, startsAt: { lte: now }, endsAt: { gte: now } },
-    orderBy: { startsAt: "desc" },
-  });
+  return db
+    .selectFrom("announcements")
+    .selectAll()
+    .where("isActive", "=", true)
+    .where("startsAt", "<=", now)
+    .where("endsAt", ">=", now)
+    .orderBy("startsAt", "desc")
+    .execute();
 }
 
 export async function create(input: CreateAnnouncementInput, createdBy: number) {
-  const announcement = await prisma.announcement.create({
-    data: {
+  const result = await db
+    .insertInto("announcements")
+    .values({
       title: input.title,
       body: input.body,
       type: input.type,
       startsAt: input.startsAt,
       endsAt: input.endsAt,
       createdBy,
-    },
-  });
+      updatedAt: new Date(),
+    })
+    .executeTakeFirstOrThrow();
+  const announcement = await db
+    .selectFrom("announcements")
+    .selectAll()
+    .where("id", "=", Number(result.insertId))
+    .executeTakeFirstOrThrow();
 
-  const students = await prisma.user.findMany({ where: { role: "user" }, select: { id: true, email: true } });
+  const students = await db.selectFrom("users").select(["id", "email"]).where("role", "=", "user").execute();
 
-  if (input.sendNotification) {
-    await prisma.notification.createMany({
-      data: students.map((s) => ({
-        userId: s.id,
-        title: announcement.title,
-        body: announcement.body,
-        type: "info" as const,
-      })),
-    });
+  if (input.sendNotification && students.length > 0) {
+    await db
+      .insertInto("notifications")
+      .values(
+        students.map((s) => ({
+          userId: s.id,
+          title: announcement.title,
+          body: announcement.body,
+          type: "info" as const,
+        }))
+      )
+      .execute();
   }
 
   if (input.sendEmail) {
@@ -50,24 +64,27 @@ export async function create(input: CreateAnnouncementInput, createdBy: number) 
 }
 
 export async function update(id: number, input: UpdateAnnouncementInput) {
-  const existing = await prisma.announcement.findUnique({ where: { id } });
+  const existing = await db.selectFrom("announcements").selectAll().where("id", "=", id).executeTakeFirst();
   if (!existing) throw new ApiError(404, "Announcement not found");
 
-  return prisma.announcement.update({
-    where: { id },
-    data: {
+  await db
+    .updateTable("announcements")
+    .set({
       ...(input.title !== undefined ? { title: input.title } : {}),
       ...(input.body !== undefined ? { body: input.body } : {}),
       ...(input.type !== undefined ? { type: input.type } : {}),
       ...(input.startsAt !== undefined ? { startsAt: input.startsAt } : {}),
       ...(input.endsAt !== undefined ? { endsAt: input.endsAt } : {}),
       ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
-    },
-  });
+      updatedAt: new Date(),
+    })
+    .where("id", "=", id)
+    .execute();
+  return db.selectFrom("announcements").selectAll().where("id", "=", id).executeTakeFirstOrThrow();
 }
 
 export async function remove(id: number) {
-  const existing = await prisma.announcement.findUnique({ where: { id } });
+  const existing = await db.selectFrom("announcements").selectAll().where("id", "=", id).executeTakeFirst();
   if (!existing) throw new ApiError(404, "Announcement not found");
-  await prisma.announcement.delete({ where: { id } });
+  await db.deleteFrom("announcements").where("id", "=", id).execute();
 }

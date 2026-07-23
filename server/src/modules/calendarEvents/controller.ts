@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { ApiError } from "../../utils/ApiError";
-import { prisma } from "../../config/db";
 import * as calendarEventService from "./service";
+import * as enrollmentService from "../enrollments/service";
 import { createCalendarEventSchema, updateCalendarEventSchema } from "./schema";
 
 export async function listForRange(req: Request, res: Response) {
@@ -15,11 +15,7 @@ export async function listForRange(req: Request, res: Response) {
 
   let visibleCourseIds: number[] | "all" = "all";
   if (req.user.role !== "admin") {
-    const enrollments = await prisma.enrollment.findMany({
-      where: { userId: req.user.id, status: "approved" },
-      select: { courseId: true },
-    });
-    visibleCourseIds = enrollments.map((e) => e.courseId);
+    visibleCourseIds = await enrollmentService.listApprovedCourseIdsForUser(req.user.id);
   }
 
   const occurrences = await calendarEventService.listForRange(rangeStart, rangeEnd, visibleCourseIds);

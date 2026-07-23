@@ -1,53 +1,76 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { ApiError } from "../../utils/ApiError";
 import { CreateChapterInput, UpdateChapterInput } from "./schema";
 
 export async function listChapters(subjectId: number) {
-  return prisma.chapter.findMany({
-    where: { subjectId },
-    orderBy: { orderIndex: "asc" },
-  });
+  return db
+    .selectFrom("chapters")
+    .selectAll()
+    .where("subjectId", "=", subjectId)
+    .orderBy("orderIndex", "asc")
+    .execute();
 }
 
 export async function createChapter(subjectId: number, input: CreateChapterInput) {
-  const subject = await prisma.subject.findUnique({ where: { id: subjectId } });
+  const subject = await db.selectFrom("subjects").select("id").where("id", "=", subjectId).executeTakeFirst();
   if (!subject) {
     throw new ApiError(404, "Subject not found");
   }
 
   let orderIndex = input.orderIndex;
   if (orderIndex === undefined) {
-    const last = await prisma.chapter.findFirst({
-      where: { subjectId },
-      orderBy: { orderIndex: "desc" },
-    });
+    const last = await db
+      .selectFrom("chapters")
+      .select("orderIndex")
+      .where("subjectId", "=", subjectId)
+      .orderBy("orderIndex", "desc")
+      .executeTakeFirst();
     orderIndex = (last?.orderIndex ?? -1) + 1;
   }
 
-  return prisma.chapter.create({
-    data: { subjectId, title: input.title, orderIndex },
-  });
+  const result = await db
+    .insertInto("chapters")
+    .values({ subjectId, title: input.title, orderIndex, updatedAt: new Date() })
+    .executeTakeFirstOrThrow();
+  return db
+    .selectFrom("chapters")
+    .selectAll()
+    .where("id", "=", Number(result.insertId))
+    .executeTakeFirstOrThrow();
 }
 
 export async function updateChapter(subjectId: number, id: number, input: UpdateChapterInput) {
-  const chapter = await prisma.chapter.findFirst({ where: { id, subjectId } });
+  const chapter = await db
+    .selectFrom("chapters")
+    .selectAll()
+    .where("id", "=", id)
+    .where("subjectId", "=", subjectId)
+    .executeTakeFirst();
   if (!chapter) {
     throw new ApiError(404, "Chapter not found");
   }
 
-  return prisma.chapter.update({
-    where: { id },
-    data: {
+  await db
+    .updateTable("chapters")
+    .set({
       ...(input.title !== undefined ? { title: input.title } : {}),
       ...(input.orderIndex !== undefined ? { orderIndex: input.orderIndex } : {}),
-    },
-  });
+      updatedAt: new Date(),
+    })
+    .where("id", "=", id)
+    .execute();
+  return db.selectFrom("chapters").selectAll().where("id", "=", id).executeTakeFirstOrThrow();
 }
 
 export async function deleteChapter(subjectId: number, id: number) {
-  const chapter = await prisma.chapter.findFirst({ where: { id, subjectId } });
+  const chapter = await db
+    .selectFrom("chapters")
+    .select("id")
+    .where("id", "=", id)
+    .where("subjectId", "=", subjectId)
+    .executeTakeFirst();
   if (!chapter) {
     throw new ApiError(404, "Chapter not found");
   }
-  await prisma.chapter.delete({ where: { id } });
+  await db.deleteFrom("chapters").where("id", "=", id).execute();
 }

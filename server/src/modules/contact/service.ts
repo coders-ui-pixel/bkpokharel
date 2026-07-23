@@ -1,10 +1,15 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { CreateContactMessageInput } from "./schema";
 
 export async function createContactMessage(input: CreateContactMessageInput) {
-  return prisma.contactMessage.create({ data: input });
+  const result = await db.insertInto("contactMessages").values(input).executeTakeFirstOrThrow();
+  return db
+    .selectFrom("contactMessages")
+    .selectAll()
+    .where("id", "=", Number(result.insertId))
+    .executeTakeFirstOrThrow();
 }
 
 export async function listContactMessages() {
-  return prisma.contactMessage.findMany({ orderBy: { createdAt: "desc" } });
+  return db.selectFrom("contactMessages").selectAll().orderBy("createdAt", "desc").execute();
 }

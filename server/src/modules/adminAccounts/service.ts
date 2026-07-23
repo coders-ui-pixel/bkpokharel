@@ -1,48 +1,62 @@
-import { AdminRole } from "@prisma/client";
-import { prisma } from "../../config/db";
+import type { AdminRole } from "../../config/enums";
+import { db } from "../../config/db";
 import { ApiError } from "../../utils/ApiError";
 import { hashPassword } from "../../services/passwordService";
 import { CreateAdminInput } from "./schema";
 
+const ADMIN_SELECT = ["id", "name", "email", "adminRole", "isActive", "createdAt"] as const;
+
 export async function listAdmins() {
-  const admins = await prisma.user.findMany({
-    where: { role: "admin" },
-    orderBy: { createdAt: "asc" },
-    select: { id: true, name: true, email: true, adminRole: true, isActive: true, createdAt: true },
-  });
-  return admins;
+  return db
+    .selectFrom("users")
+    .select(ADMIN_SELECT)
+    .where("role", "=", "admin")
+    .orderBy("createdAt", "asc")
+    .execute();
 }
 
 export async function createAdmin(input: CreateAdminInput) {
-  const existing = await prisma.user.findUnique({ where: { email: input.email } });
+  const existing = await db
+    .selectFrom("users")
+    .select("id")
+    .where("email", "=", input.email)
+    .executeTakeFirst();
   if (existing) throw new ApiError(409, "An account with this email already exists");
 
   const passwordHash = await hashPassword(input.password);
-  const admin = await prisma.user.create({
-    data: {
+  const result = await db
+    .insertInto("users")
+    .values({
       name: input.name,
       email: input.email,
       passwordHash,
       role: "admin",
       adminRole: input.adminRole,
-    },
-    select: { id: true, name: true, email: true, adminRole: true, isActive: true, createdAt: true },
-  });
-  return admin;
+      updatedAt: new Date(),
+    })
+    .executeTakeFirstOrThrow();
+  return db
+    .selectFrom("users")
+    .select(ADMIN_SELECT)
+    .where("id", "=", Number(result.insertId))
+    .executeTakeFirstOrThrow();
 }
 
 async function countSuperAdmins(excludeUserId?: number): Promise<number> {
-  return prisma.user.count({
-    where: {
-      role: "admin",
-      adminRole: "super_admin",
-      ...(excludeUserId ? { id: { not: excludeUserId } } : {}),
-    },
-  });
+  let query = db
+    .selectFrom("users")
+    .select((eb) => eb.fn.countAll().as("count"))
+    .where("role", "=", "admin")
+    .where("adminRole", "=", "super_admin");
+  if (excludeUserId) {
+    query = query.where("id", "!=", excludeUserId);
+  }
+  const result = await query.executeTakeFirstOrThrow();
+  return Number(result.count);
 }
 
 export async function updateAdminRole(id: number, adminRole: AdminRole) {
-  const target = await prisma.user.findUnique({ where: { id } });
+  const target = await db.selectFrom("users").selectAll().where("id", "=", id).executeTakeFirst();
   if (!target || target.role !== "admin") throw new ApiError(404, "Admin account not found");
 
   if (target.adminRole === "super_admin" && adminRole !== "super_admin") {
@@ -52,18 +66,18 @@ export async function updateAdminRole(id: number, adminRole: AdminRole) {
     }
   }
 
-  const updated = await prisma.user.update({
-    where: { id },
-    data: { adminRole },
-    select: { id: true, name: true, email: true, adminRole: true, isActive: true, createdAt: true },
-  });
-  return updated;
+  await db
+    .updateTable("users")
+    .set({ adminRole, updatedAt: new Date() })
+    .where("id", "=", id)
+    .execute();
+  return db.selectFrom("users").select(ADMIN_SELECT).where("id", "=", id).executeTakeFirstOrThrow();
 }
 
 export async function removeAdmin(id: number, requesterId: number) {
   if (id === requesterId) throw new ApiError(400, "You cannot remove your own admin account");
 
-  const target = await prisma.user.findUnique({ where: { id } });
+  const target = await db.selectFrom("users").selectAll().where("id", "=", id).executeTakeFirst();
   if (!target || target.role !== "admin") throw new ApiError(404, "Admin account not found");
 
   if (target.adminRole === "super_admin") {
@@ -73,5 +87,5 @@ export async function removeAdmin(id: number, requesterId: number) {
     }
   }
 
-  await prisma.user.delete({ where: { id } });
+  await db.deleteFrom("users").where("id", "=", id).execute();
 }

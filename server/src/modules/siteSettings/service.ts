@@ -1,17 +1,19 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { UpdateSiteSettingsInput } from "./schema";
 
 export async function getSettings() {
-  const existing = await prisma.siteSettings.findUnique({ where: { id: 1 } });
+  const existing = await db.selectFrom("siteSettings").selectAll().where("id", "=", 1).executeTakeFirst();
   if (existing) return existing;
-  return prisma.siteSettings.create({ data: { id: 1 } });
+
+  await db.insertInto("siteSettings").values({ id: 1, updatedAt: new Date() }).execute();
+  return db.selectFrom("siteSettings").selectAll().where("id", "=", 1).executeTakeFirstOrThrow();
 }
 
 export async function updateSettings(input: UpdateSiteSettingsInput) {
   await getSettings();
-  return prisma.siteSettings.update({
-    where: { id: 1 },
-    data: {
+  await db
+    .updateTable("siteSettings")
+    .set({
       ...(input.siteName !== undefined ? { siteName: input.siteName } : {}),
       ...(input.themePrimaryColor !== undefined ? { themePrimaryColor: input.themePrimaryColor } : {}),
       ...(input.themeSecondaryColor !== undefined
@@ -21,22 +23,29 @@ export async function updateSettings(input: UpdateSiteSettingsInput) {
       ...(input.instagramUrl !== undefined ? { instagramUrl: input.instagramUrl } : {}),
       ...(input.tiktokUrl !== undefined ? { tiktokUrl: input.tiktokUrl } : {}),
       ...(input.youtubeUrl !== undefined ? { youtubeUrl: input.youtubeUrl } : {}),
-    },
-  });
+      updatedAt: new Date(),
+    })
+    .where("id", "=", 1)
+    .execute();
+  return db.selectFrom("siteSettings").selectAll().where("id", "=", 1).executeTakeFirstOrThrow();
 }
 
 export async function setLogo(filename: string) {
   await getSettings();
-  return prisma.siteSettings.update({
-    where: { id: 1 },
-    data: { logoImagePath: `/uploads/branding/${filename}` },
-  });
+  await db
+    .updateTable("siteSettings")
+    .set({ logoImagePath: `/uploads/branding/${filename}`, updatedAt: new Date() })
+    .where("id", "=", 1)
+    .execute();
+  return db.selectFrom("siteSettings").selectAll().where("id", "=", 1).executeTakeFirstOrThrow();
 }
 
 export async function setFavicon(filename: string) {
   await getSettings();
-  return prisma.siteSettings.update({
-    where: { id: 1 },
-    data: { faviconImagePath: `/uploads/branding/${filename}` },
-  });
+  await db
+    .updateTable("siteSettings")
+    .set({ faviconImagePath: `/uploads/branding/${filename}`, updatedAt: new Date() })
+    .where("id", "=", 1)
+    .execute();
+  return db.selectFrom("siteSettings").selectAll().where("id", "=", 1).executeTakeFirstOrThrow();
 }

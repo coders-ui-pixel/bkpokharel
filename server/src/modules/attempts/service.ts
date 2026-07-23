@@ -1,56 +1,87 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { ApiError } from "../../utils/ApiError";
 import * as gamificationService from "../gamification/service";
 import { XP_RULES } from "../gamification/badges";
 import { SubmitPracticeInput } from "./schema";
 
 export async function startPractice(userId: number, questionSetId: number) {
-  const set = await prisma.questionSet.findUnique({
-    where: { id: questionSetId },
-    include: { items: { include: { question: true }, orderBy: { orderIndex: "asc" } } },
-  });
+  const set = await db.selectFrom("questionSets").selectAll().where("id", "=", questionSetId).executeTakeFirst();
   if (!set || !set.isPublished) throw new ApiError(404, "Question set not found");
-  if (set.items.length === 0) throw new ApiError(400, "This question set has no questions yet");
 
-  const existing = await prisma.practiceAttempt.findFirst({
-    where: { userId, questionSetId, status: "in_progress" },
-  });
+  const items = await db
+    .selectFrom("questionSetItems")
+    .innerJoin("questions", "questions.id", "questionSetItems.questionId")
+    .select([
+      "questions.id as id",
+      "questions.questionText as questionText",
+      "questions.optionA as optionA",
+      "questions.optionB as optionB",
+      "questions.optionC as optionC",
+      "questions.optionD as optionD",
+      "questions.marks as marks",
+      "questionSetItems.orderIndex as orderIndex",
+    ])
+    .where("questionSetItems.questionSetId", "=", questionSetId)
+    .orderBy("questionSetItems.orderIndex", "asc")
+    .execute();
+  if (items.length === 0) throw new ApiError(400, "This question set has no questions yet");
 
-  const totalMarks = set.items.reduce((sum, item) => sum + Number(item.question.marks), 0);
+  const existing = await db
+    .selectFrom("practiceAttempts")
+    .selectAll()
+    .where("userId", "=", userId)
+    .where("questionSetId", "=", questionSetId)
+    .where("status", "=", "in_progress")
+    .executeTakeFirst();
+
+  const totalMarks = items.reduce((sum, item) => sum + Number(item.marks), 0);
 
   const attempt =
     existing ??
-    (await prisma.practiceAttempt.create({
-      data: { userId, questionSetId, totalMarks },
-    }));
+    (await (async () => {
+      const result = await db
+        .insertInto("practiceAttempts")
+        .values({ userId, questionSetId, totalMarks })
+        .executeTakeFirstOrThrow();
+      return db
+        .selectFrom("practiceAttempts")
+        .selectAll()
+        .where("id", "=", Number(result.insertId))
+        .executeTakeFirstOrThrow();
+    })());
 
   return {
     attempt,
-    questions: set.items.map((item) => ({
-      id: item.question.id,
-      questionText: item.question.questionText,
-      optionA: item.question.optionA,
-      optionB: item.question.optionB,
-      optionC: item.question.optionC,
-      optionD: item.question.optionD,
-      marks: item.question.marks,
+    questions: items.map((item) => ({
+      id: item.id,
+      questionText: item.questionText,
+      optionA: item.optionA,
+      optionB: item.optionB,
+      optionC: item.optionC,
+      optionD: item.optionD,
+      marks: item.marks,
     })),
     negativeMarking: set.negativeMarking,
   };
 }
 
 export async function submitPractice(userId: number, attemptId: number, input: SubmitPracticeInput) {
-  const attempt = await prisma.practiceAttempt.findUnique({
-    where: { id: attemptId },
-    include: { questionSet: true },
-  });
+  const attempt = await db
+    .selectFrom("practiceAttempts")
+    .innerJoin("questionSets", "questionSets.id", "practiceAttempts.questionSetId")
+    .select(["practiceAttempts.userId as userId", "practiceAttempts.status as status", "questionSets.negativeMarking as negativeMarking"])
+    .where("practiceAttempts.id", "=", attemptId)
+    .executeTakeFirst();
   if (!attempt || attempt.userId !== userId) throw new ApiError(404, "Attempt not found");
   if (attempt.status === "submitted") throw new ApiError(409, "This attempt has already been submitted");
 
   const questionIds = input.answers.map((a) => a.questionId);
-  const questions = await prisma.question.findMany({ where: { id: { in: questionIds } } });
+  const questions =
+    questionIds.length > 0
+      ? await db.selectFrom("questions").selectAll().where("id", "in", questionIds).execute()
+      : [];
   const questionById = new Map(questions.map((q) => [q.id, q]));
-  const negativeMarking = Number(attempt.questionSet.negativeMarking);
+  const negativeMarking = Number(attempt.negativeMarking);
 
   let score = 0;
   const answerRows = input.answers.map((answer) => {
@@ -68,20 +99,23 @@ export async function submitPractice(userId: number, attemptId: number, input: S
     return {
       attemptId,
       questionId: answer.questionId,
-      selectedOption: answer.selectedOption,
+      selectedOption: answer.selectedOption ?? null,
       isCorrect,
       marksAwarded,
     };
   });
 
-  await prisma.$transaction([
-    prisma.attemptAnswer.deleteMany({ where: { attemptId } }),
-    prisma.attemptAnswer.createMany({ data: answerRows }),
-    prisma.practiceAttempt.update({
-      where: { id: attemptId },
-      data: { status: "submitted", submittedAt: new Date(), score },
-    }),
-  ]);
+  await db.transaction().execute(async (trx) => {
+    await trx.deleteFrom("attemptAnswers").where("attemptId", "=", attemptId).execute();
+    if (answerRows.length > 0) {
+      await trx.insertInto("attemptAnswers").values(answerRows).execute();
+    }
+    await trx
+      .updateTable("practiceAttempts")
+      .set({ status: "submitted", submittedAt: new Date(), score: String(score) })
+      .where("id", "=", attemptId)
+      .execute();
+  });
 
   await gamificationService.awardActivity(userId, XP_RULES.PRACTICE_SUBMIT);
 
@@ -89,23 +123,51 @@ export async function submitPractice(userId: number, attemptId: number, input: S
 }
 
 export async function getAttemptDetail(userId: number, attemptId: number) {
-  const attempt = await prisma.practiceAttempt.findUnique({
-    where: { id: attemptId },
-    include: {
-      questionSet: true,
-      answers: { include: { question: true } },
-    },
-  });
+  const attempt = await db
+    .selectFrom("practiceAttempts")
+    .innerJoin("questionSets", "questionSets.id", "practiceAttempts.questionSetId")
+    .select([
+      "practiceAttempts.id as id",
+      "practiceAttempts.userId as userId",
+      "practiceAttempts.questionSetId as questionSetId",
+      "practiceAttempts.status as status",
+      "practiceAttempts.score as score",
+      "practiceAttempts.totalMarks as totalMarks",
+      "practiceAttempts.startedAt as startedAt",
+      "practiceAttempts.submittedAt as submittedAt",
+      "questionSets.title as questionSetTitle",
+    ])
+    .where("practiceAttempts.id", "=", attemptId)
+    .executeTakeFirst();
   if (!attempt || attempt.userId !== userId) throw new ApiError(404, "Attempt not found");
 
-  const correctCount = attempt.answers.filter((a) => a.isCorrect === true).length;
-  const wrongCount = attempt.answers.filter((a) => a.isCorrect === false).length;
-  const unansweredCount = attempt.answers.filter((a) => a.selectedOption === null).length;
+  const answers = await db
+    .selectFrom("attemptAnswers")
+    .innerJoin("questions", "questions.id", "attemptAnswers.questionId")
+    .select([
+      "attemptAnswers.questionId as questionId",
+      "questions.questionText as questionText",
+      "questions.optionA as optionA",
+      "questions.optionB as optionB",
+      "questions.optionC as optionC",
+      "questions.optionD as optionD",
+      "questions.correctOption as correctOption",
+      "attemptAnswers.selectedOption as selectedOption",
+      "attemptAnswers.isCorrect as isCorrect",
+      "attemptAnswers.marksAwarded as marksAwarded",
+      "questions.explanation as explanation",
+    ])
+    .where("attemptAnswers.attemptId", "=", attemptId)
+    .execute();
+
+  const correctCount = answers.filter((a) => a.isCorrect === true).length;
+  const wrongCount = answers.filter((a) => a.isCorrect === false).length;
+  const unansweredCount = answers.filter((a) => a.selectedOption === null).length;
 
   return {
     id: attempt.id,
     questionSetId: attempt.questionSetId,
-    questionSetTitle: attempt.questionSet.title,
+    questionSetTitle: attempt.questionSetTitle,
     status: attempt.status,
     score: attempt.score,
     totalMarks: attempt.totalMarks,
@@ -114,26 +176,36 @@ export async function getAttemptDetail(userId: number, attemptId: number) {
     correctCount,
     wrongCount,
     unansweredCount,
-    answers: attempt.answers.map((a) => ({
-      questionId: a.questionId,
-      questionText: a.question.questionText,
-      optionA: a.question.optionA,
-      optionB: a.question.optionB,
-      optionC: a.question.optionC,
-      optionD: a.question.optionD,
-      correctOption: a.question.correctOption,
-      selectedOption: a.selectedOption,
-      isCorrect: a.isCorrect,
-      marksAwarded: a.marksAwarded,
-      explanation: a.question.explanation,
-    })),
+    answers,
   };
 }
 
 export async function listMyAttempts(userId: number) {
-  return prisma.practiceAttempt.findMany({
-    where: { userId },
-    include: { questionSet: true },
-    orderBy: { startedAt: "desc" },
-  });
+  const attempts = await db
+    .selectFrom("practiceAttempts")
+    .innerJoin("questionSets", "questionSets.id", "practiceAttempts.questionSetId")
+    .select([
+      "practiceAttempts.id as id",
+      "practiceAttempts.questionSetId as questionSetId",
+      "practiceAttempts.status as status",
+      "practiceAttempts.score as score",
+      "practiceAttempts.totalMarks as totalMarks",
+      "practiceAttempts.startedAt as startedAt",
+      "practiceAttempts.submittedAt as submittedAt",
+      "questionSets.title as questionSetTitle",
+    ])
+    .where("practiceAttempts.userId", "=", userId)
+    .orderBy("practiceAttempts.startedAt", "desc")
+    .execute();
+
+  return attempts.map((a) => ({
+    id: a.id,
+    questionSetId: a.questionSetId,
+    status: a.status,
+    score: a.score,
+    totalMarks: a.totalMarks,
+    startedAt: a.startedAt,
+    submittedAt: a.submittedAt,
+    questionSet: { title: a.questionSetTitle },
+  }));
 }

@@ -1,22 +1,38 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { ApiError } from "../../utils/ApiError";
 import { ToggleBookmarkInput } from "./schema";
 
 async function assertContentExists(contentType: ToggleBookmarkInput["contentType"], contentId: number) {
   if (contentType === "note") {
-    const note = await prisma.note.findUnique({ where: { id: contentId } });
+    const note = await db.selectFrom("notes").select("id").where("id", "=", contentId).executeTakeFirst();
     if (!note) throw new ApiError(404, "Note not found");
   } else {
-    const item = await prisma.importantQuestion.findUnique({ where: { id: contentId } });
+    const item = await db
+      .selectFrom("importantQuestions")
+      .select("id")
+      .where("id", "=", contentId)
+      .executeTakeFirst();
     if (!item) throw new ApiError(404, "Important question item not found");
   }
 }
 
+function findBookmark(userId: number, contentType: string, contentId: number) {
+  return db
+    .selectFrom("bookmarks")
+    .selectAll()
+    .where("userId", "=", userId)
+    .where("contentType", "=", contentType as "note" | "important_question")
+    .where("contentId", "=", contentId)
+    .executeTakeFirst();
+}
+
 export async function listForUser(userId: number) {
-  const bookmarks = await prisma.bookmark.findMany({
-    where: { userId },
-    orderBy: { createdAt: "desc" },
-  });
+  const bookmarks = await db
+    .selectFrom("bookmarks")
+    .selectAll()
+    .where("userId", "=", userId)
+    .orderBy("createdAt", "desc")
+    .execute();
 
   const noteIds = bookmarks.filter((b) => b.contentType === "note").map((b) => b.contentId);
   const iqIds = bookmarks
@@ -25,10 +41,10 @@ export async function listForUser(userId: number) {
 
   const [notes, importantQuestions] = await Promise.all([
     noteIds.length
-      ? prisma.note.findMany({ where: { id: { in: noteIds } } })
+      ? db.selectFrom("notes").selectAll().where("id", "in", noteIds).execute()
       : Promise.resolve([]),
     iqIds.length
-      ? prisma.importantQuestion.findMany({ where: { id: { in: iqIds } } })
+      ? db.selectFrom("importantQuestions").selectAll().where("id", "in", iqIds).execute()
       : Promise.resolve([]),
   ]);
 
@@ -68,24 +84,17 @@ export async function listForUser(userId: number) {
 }
 
 export async function toggle(userId: number, input: ToggleBookmarkInput) {
-  const existing = await prisma.bookmark.findUnique({
-    where: {
-      userId_contentType_contentId: {
-        userId,
-        contentType: input.contentType,
-        contentId: input.contentId,
-      },
-    },
-  });
+  const existing = await findBookmark(userId, input.contentType, input.contentId);
 
   if (existing) {
-    await prisma.bookmark.delete({ where: { id: existing.id } });
+    await db.deleteFrom("bookmarks").where("id", "=", existing.id).execute();
     return { bookmarked: false };
   }
 
   await assertContentExists(input.contentType, input.contentId);
-  await prisma.bookmark.create({
-    data: { userId, contentType: input.contentType, contentId: input.contentId },
-  });
+  await db
+    .insertInto("bookmarks")
+    .values({ userId, contentType: input.contentType, contentId: input.contentId })
+    .execute();
   return { bookmarked: true };
 }

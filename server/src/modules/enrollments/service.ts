@@ -1,14 +1,18 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { ApiError } from "../../utils/ApiError";
 import { deleteUploadedFile, publicPathFor } from "../../middleware/upload";
 import * as notificationService from "../notifications/service";
 import * as auditLogService from "../auditLogs/service";
 import * as couponService from "../coupons/service";
 
+function findEnrollment(userId: number, courseId: number) {
+  return db.selectFrom("enrollments").selectAll().where("userId", "=", userId).where("courseId", "=", courseId).executeTakeFirst();
+}
+
 async function redeemCouponIfProvided(
   couponCode: string | undefined,
   courseId: number,
-  course: { isPaid: boolean; price: unknown }
+  course: { isPaid: boolean; price: string | null }
 ): Promise<{ couponId: number | null; discountedPrice: number | null }> {
   if (!couponCode || !course.isPaid || !course.price) {
     return { couponId: null, discountedPrice: null };
@@ -26,7 +30,7 @@ export async function requestEnrollment(
   proofFilename?: string,
   couponCode?: string
 ) {
-  const course = await prisma.course.findUnique({ where: { id: courseId } });
+  const course = await db.selectFrom("courses").selectAll().where("id", "=", courseId).executeTakeFirst();
   if (!course || !course.isPublished) {
     throw new ApiError(404, "Course not found");
   }
@@ -37,9 +41,7 @@ export async function requestEnrollment(
 
   const paymentProofImagePath = proofFilename ? publicPathFor("payment-proofs", proofFilename) : null;
 
-  const existing = await prisma.enrollment.findUnique({
-    where: { userId_courseId: { userId, courseId } },
-  });
+  const existing = await findEnrollment(userId, courseId);
 
   if (existing) {
     if (existing.status === "approved") {
@@ -59,80 +61,158 @@ export async function requestEnrollment(
     if (existing.paymentProofImagePath) {
       deleteUploadedFile(existing.paymentProofImagePath);
     }
-    return prisma.enrollment.update({
-      where: { id: existing.id },
-      data: {
+    await db
+      .updateTable("enrollments")
+      .set({
         status: "pending",
         phone,
         paymentProofImagePath,
         couponId,
-        discountedPrice,
+        discountedPrice: discountedPrice !== null ? String(discountedPrice) : null,
         reviewedBy: null,
         reviewedAt: null,
-      },
-    });
+        updatedAt: new Date(),
+      })
+      .where("id", "=", existing.id)
+      .execute();
+    return db.selectFrom("enrollments").selectAll().where("id", "=", existing.id).executeTakeFirstOrThrow();
   }
 
   const { couponId, discountedPrice } = await redeemCouponIfProvided(couponCode, courseId, course);
 
-  return prisma.enrollment.create({
-    data: { userId, courseId, phone, paymentProofImagePath, couponId, discountedPrice },
-  });
+  const result = await db
+    .insertInto("enrollments")
+    .values({
+      userId,
+      courseId,
+      phone,
+      paymentProofImagePath,
+      couponId,
+      discountedPrice: discountedPrice !== null ? String(discountedPrice) : null,
+      updatedAt: new Date(),
+    })
+    .executeTakeFirstOrThrow();
+  return db.selectFrom("enrollments").selectAll().where("id", "=", Number(result.insertId)).executeTakeFirstOrThrow();
 }
 
 export async function listMyEnrollments(userId: number) {
-  return prisma.enrollment.findMany({
-    where: { userId },
-    include: { course: true },
-    orderBy: { requestedAt: "desc" },
-  });
+  return db
+    .selectFrom("enrollments")
+    .innerJoin("courses", "courses.id", "enrollments.courseId")
+    .selectAll("enrollments")
+    .select(["courses.id as courseRefId", "courses.title as courseTitle", "courses.slug as courseSlug", "courses.isPaid as courseIsPaid"])
+    .where("enrollments.userId", "=", userId)
+    .orderBy("enrollments.requestedAt", "desc")
+    .execute()
+    .then((rows) =>
+      rows.map((r) => ({
+        id: r.id,
+        userId: r.userId,
+        courseId: r.courseId,
+        status: r.status,
+        phone: r.phone,
+        paymentProofImagePath: r.paymentProofImagePath,
+        requestedAt: r.requestedAt,
+        reviewedAt: r.reviewedAt,
+        reviewedBy: r.reviewedBy,
+        couponId: r.couponId,
+        discountedPrice: r.discountedPrice,
+        updatedAt: r.updatedAt,
+        course: { id: r.courseRefId, title: r.courseTitle, slug: r.courseSlug, isPaid: r.courseIsPaid },
+      }))
+    );
 }
 
 export async function getMyEnrollment(userId: number, courseId: number) {
-  return prisma.enrollment.findUnique({ where: { userId_courseId: { userId, courseId } } });
+  return findEnrollment(userId, courseId);
 }
 
 export async function isEnrolled(userId: number, courseId: number): Promise<boolean> {
-  const existing = await prisma.enrollment.findUnique({
-    where: { userId_courseId: { userId, courseId } },
-  });
+  const existing = await findEnrollment(userId, courseId);
   return existing?.status === "approved";
 }
 
-export async function unenroll(userId: number, courseId: number) {
-  await prisma.enrollment.deleteMany({ where: { userId, courseId } });
+export async function listApprovedCourseIdsForUser(userId: number): Promise<number[]> {
+  const rows = await db
+    .selectFrom("enrollments")
+    .select("courseId")
+    .where("userId", "=", userId)
+    .where("status", "=", "approved")
+    .execute();
+  return rows.map((r) => r.courseId);
 }
 
-export async function listRequestsForAdmin(filters: {
-  status?: "pending" | "approved" | "rejected";
-  courseId?: number;
-}) {
-  return prisma.enrollment.findMany({
-    where: {
-      ...(filters.status ? { status: filters.status } : {}),
-      ...(filters.courseId ? { courseId: filters.courseId } : {}),
-    },
-    include: {
-      user: { select: { id: true, name: true, email: true, phone: true, college: true } },
-      course: { select: { id: true, title: true, isPaid: true, price: true } },
-      coupon: { select: { id: true, code: true, name: true, discountPercent: true } },
-    },
-    orderBy: { requestedAt: "desc" },
-  });
+export async function unenroll(userId: number, courseId: number) {
+  await db.deleteFrom("enrollments").where("userId", "=", userId).where("courseId", "=", courseId).execute();
+}
+
+export async function listRequestsForAdmin(filters: { status?: "pending" | "approved" | "rejected"; courseId?: number }) {
+  const rows = await db
+    .selectFrom("enrollments")
+    .innerJoin("users", "users.id", "enrollments.userId")
+    .innerJoin("courses", "courses.id", "enrollments.courseId")
+    .leftJoin("coupons", "coupons.id", "enrollments.couponId")
+    .selectAll("enrollments")
+    .select([
+      "users.id as userRefId",
+      "users.name as userName",
+      "users.email as userEmail",
+      "users.phone as userPhone",
+      "users.college as userCollege",
+      "courses.id as courseRefId",
+      "courses.title as courseTitle",
+      "courses.isPaid as courseIsPaid",
+      "courses.price as coursePrice",
+      "coupons.id as couponRefId",
+      "coupons.code as couponCode",
+      "coupons.name as couponName",
+      "coupons.discountPercent as couponDiscountPercent",
+    ])
+    .$if(filters.status !== undefined, (qb) => qb.where("enrollments.status", "=", filters.status as "pending" | "approved" | "rejected"))
+    .$if(filters.courseId !== undefined, (qb) => qb.where("enrollments.courseId", "=", filters.courseId as number))
+    .orderBy("enrollments.requestedAt", "desc")
+    .execute();
+
+  return rows.map((r) => ({
+    id: r.id,
+    userId: r.userId,
+    courseId: r.courseId,
+    status: r.status,
+    phone: r.phone,
+    paymentProofImagePath: r.paymentProofImagePath,
+    requestedAt: r.requestedAt,
+    reviewedAt: r.reviewedAt,
+    reviewedBy: r.reviewedBy,
+    couponId: r.couponId,
+    discountedPrice: r.discountedPrice,
+    updatedAt: r.updatedAt,
+    user: { id: r.userRefId, name: r.userName, email: r.userEmail, phone: r.userPhone, college: r.userCollege },
+    course: { id: r.courseRefId, title: r.courseTitle, isPaid: r.courseIsPaid, price: r.coursePrice },
+    coupon:
+      r.couponRefId !== null
+        ? { id: r.couponRefId, code: r.couponCode, name: r.couponName, discountPercent: r.couponDiscountPercent }
+        : null,
+  }));
 }
 
 export async function countPendingRequests(courseId?: number) {
-  return prisma.enrollment.count({
-    where: { status: "pending", ...(courseId ? { courseId } : {}) },
-  });
+  const row = await db
+    .selectFrom("enrollments")
+    .select((eb) => eb.fn.countAll().as("count"))
+    .where("status", "=", "pending")
+    .$if(courseId !== undefined, (qb) => qb.where("courseId", "=", courseId as number))
+    .executeTakeFirstOrThrow();
+  return Number(row.count);
 }
 
-export async function reviewEnrollment(
-  id: number,
-  decision: "approved" | "rejected",
-  adminId: number
-) {
-  const existing = await prisma.enrollment.findUnique({ where: { id }, include: { course: true } });
+export async function reviewEnrollment(id: number, decision: "approved" | "rejected", adminId: number) {
+  const existing = await db
+    .selectFrom("enrollments")
+    .innerJoin("courses", "courses.id", "enrollments.courseId")
+    .selectAll("enrollments")
+    .select(["courses.title as courseTitle"])
+    .where("enrollments.id", "=", id)
+    .executeTakeFirst();
   if (!existing) throw new ApiError(404, "Enrollment request not found");
   if (existing.status !== "pending") {
     throw new ApiError(409, "This request has already been reviewed");
@@ -142,16 +222,18 @@ export async function reviewEnrollment(
     await couponService.releaseCouponRedemption(existing.couponId);
   }
 
-  const updated = await prisma.enrollment.update({
-    where: { id },
-    data: { status: decision, reviewedBy: adminId, reviewedAt: new Date() },
-  });
+  await db
+    .updateTable("enrollments")
+    .set({ status: decision, reviewedBy: adminId, reviewedAt: new Date(), updatedAt: new Date() })
+    .where("id", "=", id)
+    .execute();
+  const updated = await db.selectFrom("enrollments").selectAll().where("id", "=", id).executeTakeFirstOrThrow();
 
   await notificationService.notify(existing.userId, {
     title:
       decision === "approved"
-        ? `You're enrolled in ${existing.course.title}`
-        : `Your enrollment request for ${existing.course.title} was rejected`,
+        ? `You're enrolled in ${existing.courseTitle}`
+        : `Your enrollment request for ${existing.courseTitle} was rejected`,
     body:
       decision === "approved"
         ? "Your enrollment has been approved. You can now access all course content."
@@ -162,7 +244,7 @@ export async function reviewEnrollment(
 
   await auditLogService.log(adminId, `enrollment.${decision}`, "enrollment", existing.id, {
     userId: existing.userId,
-    courseTitle: existing.course.title,
+    courseTitle: existing.courseTitle,
   });
 
   return updated;

@@ -1,28 +1,38 @@
-import { prisma } from "../../config/db";
+import { db } from "../../config/db";
 import { ApiError } from "../../utils/ApiError";
 import { deleteUploadedFile, publicPathFor } from "../../middleware/upload";
 import { CreateImportantQuestionInput } from "./schema";
 
 export async function assertCanAccessChapter(userId: number, chapterId: number) {
-  const chapter = await prisma.chapter.findUnique({
-    where: { id: chapterId },
-    include: { subject: true },
-  });
+  const chapter = await db
+    .selectFrom("chapters")
+    .innerJoin("subjects", "subjects.id", "chapters.subjectId")
+    .select(["chapters.id as id", "subjects.courseId as courseId"])
+    .where("chapters.id", "=", chapterId)
+    .executeTakeFirst();
   if (!chapter) throw new ApiError(404, "Chapter not found");
-  if (chapter.subject.courseId === null) {
+  if (chapter.courseId === null) {
     throw new ApiError(403, "This chapter's subject is not yet assigned to a course");
   }
 
-  const enrollment = await prisma.enrollment.findUnique({
-    where: { userId_courseId: { userId, courseId: chapter.subject.courseId } },
-  });
+  const enrollment = await db
+    .selectFrom("enrollments")
+    .select("status")
+    .where("userId", "=", userId)
+    .where("courseId", "=", chapter.courseId)
+    .executeTakeFirst();
   if (!enrollment || enrollment.status !== "approved") {
     throw new ApiError(403, "You must be enrolled in this course to view this");
   }
 }
 
 export async function listForChapter(chapterId: number) {
-  return prisma.importantQuestion.findMany({ where: { chapterId }, orderBy: { orderIndex: "asc" } });
+  return db
+    .selectFrom("importantQuestions")
+    .selectAll()
+    .where("chapterId", "=", chapterId)
+    .orderBy("orderIndex", "asc")
+    .execute();
 }
 
 export async function create(
@@ -32,59 +42,78 @@ export async function create(
   mimeType: string,
   uploadedBy: number
 ) {
-  const chapter = await prisma.chapter.findUnique({ where: { id: chapterId } });
+  const chapter = await db.selectFrom("chapters").select("id").where("id", "=", chapterId).executeTakeFirst();
   if (!chapter) throw new ApiError(404, "Chapter not found");
 
-  const last = await prisma.importantQuestion.findFirst({
-    where: { chapterId },
-    orderBy: { orderIndex: "desc" },
-  });
+  const last = await db
+    .selectFrom("importantQuestions")
+    .select("orderIndex")
+    .where("chapterId", "=", chapterId)
+    .orderBy("orderIndex", "desc")
+    .executeTakeFirst();
   const orderIndex = (last?.orderIndex ?? -1) + 1;
 
-  return prisma.importantQuestion.create({
-    data: {
+  const result = await db
+    .insertInto("importantQuestions")
+    .values({
       chapterId,
       title: input.title,
       filePath: publicPathFor("important-questions", filename),
       mimeType,
       orderIndex,
       uploadedBy,
-    },
-  });
+      updatedAt: new Date(),
+    })
+    .executeTakeFirstOrThrow();
+  return db
+    .selectFrom("importantQuestions")
+    .selectAll()
+    .where("id", "=", Number(result.insertId))
+    .executeTakeFirstOrThrow();
 }
 
 export async function remove(id: number) {
-  const item = await prisma.importantQuestion.findUnique({ where: { id } });
+  const item = await db.selectFrom("importantQuestions").selectAll().where("id", "=", id).executeTakeFirst();
   if (!item) throw new ApiError(404, "Not found");
   deleteUploadedFile(item.filePath);
-  await prisma.importantQuestion.delete({ where: { id } });
+  await db.deleteFrom("importantQuestions").where("id", "=", id).execute();
 }
 
 export async function reorder(id: number, direction: "up" | "down") {
-  const item = await prisma.importantQuestion.findUnique({ where: { id } });
+  const item = await db.selectFrom("importantQuestions").selectAll().where("id", "=", id).executeTakeFirst();
   if (!item) throw new ApiError(404, "Not found");
 
-  const sibling = await prisma.importantQuestion.findFirst({
-    where: {
-      chapterId: item.chapterId,
-      orderIndex: direction === "up" ? { lt: item.orderIndex } : { gt: item.orderIndex },
-    },
-    orderBy: { orderIndex: direction === "up" ? "desc" : "asc" },
-  });
+  const sibling = await db
+    .selectFrom("importantQuestions")
+    .selectAll()
+    .where("chapterId", "=", item.chapterId)
+    .where("orderIndex", direction === "up" ? "<" : ">", item.orderIndex)
+    .orderBy("orderIndex", direction === "up" ? "desc" : "asc")
+    .executeTakeFirst();
   if (!sibling) return;
 
-  await prisma.$transaction([
-    prisma.importantQuestion.update({ where: { id: item.id }, data: { orderIndex: sibling.orderIndex } }),
-    prisma.importantQuestion.update({ where: { id: sibling.id }, data: { orderIndex: item.orderIndex } }),
-  ]);
+  await db.transaction().execute(async (trx) => {
+    await trx
+      .updateTable("importantQuestions")
+      .set({ orderIndex: sibling.orderIndex, updatedAt: new Date() })
+      .where("id", "=", item.id)
+      .execute();
+    await trx
+      .updateTable("importantQuestions")
+      .set({ orderIndex: item.orderIndex, updatedAt: new Date() })
+      .where("id", "=", sibling.id)
+      .execute();
+  });
 }
 
 export async function getBookmarkCounts(itemIds: number[]) {
   if (itemIds.length === 0) return new Map<number, number>();
-  const rows = await prisma.bookmark.groupBy({
-    by: ["contentId"],
-    where: { contentType: "important_question", contentId: { in: itemIds } },
-    _count: { contentId: true },
-  });
-  return new Map(rows.map((r) => [r.contentId, r._count.contentId]));
+  const rows = await db
+    .selectFrom("bookmarks")
+    .select(["contentId", (eb) => eb.fn.countAll().as("count")])
+    .where("contentType", "=", "important_question")
+    .where("contentId", "in", itemIds)
+    .groupBy("contentId")
+    .execute();
+  return new Map(rows.map((r) => [r.contentId, Number(r.count)]));
 }
